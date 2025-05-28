@@ -1,0 +1,63 @@
+{
+    "data_config": {
+        "stock_code": "000063.SZ",
+        "stock_name": "中兴通讯",
+        "start_date": "20210101",
+        "end_date": "20250101",
+        "api_token": "db1723bf9e9009f186c134b6813da7730256c87f31759400e170ddab"
+    },
+    "model_config": {
+        "test_size": 0.1,
+        "random_state": 120,
+        "threshold": 0.0025,
+        "initial_params": {
+            "max_depth": 3,
+            "n_estimators": 10,
+            "min_samples_leaf": 10
+        },
+        "grid_search_params": {
+            "n_estimators": [5, 10, 20],
+            "max_depth": [2, 3, 4, 5, 6],
+            "min_samples_leaf": [5, 10, 20, 30]
+        },
+        "cv_folds": 6
+    },
+    "features_config": {
+        "price_features": ["close", "vol", "O-C", "H-L"],
+        "ma_periods": [5, 10],
+        "technical_indicators": {
+            "rsi_window": 14,
+            "ema_windows": [12, 26],
+            "macd_params": {
+                "window_fast": 6,
+                "window_slow": 12,
+                "window_sign": 9
+            }
+        }
+    },
+    "output_config": {
+        "data_folder": "data",
+        "reports_folder": "reports",
+        "model_folder": "rf-model",
+        "save_plots": true,
+        "plot_size": {
+            "feature_importance": [10, 6],
+            "confusion_matrix": [8, 8],
+            "roc_curve": [8, 8]
+        }
+    },
+    "unified_predictor": {
+        "default_data_days": 60,
+        "supported_periods": [1, 5, 20],
+        "period_thresholds": {
+            "1": 0.0025,
+            "5": 0.01,
+            "20": 0.03
+        },
+        "confidence_levels": {
+            "high": 0.8,
+            "medium": 0.7,
+            "low": 0.6
+        }
+    }
+} 

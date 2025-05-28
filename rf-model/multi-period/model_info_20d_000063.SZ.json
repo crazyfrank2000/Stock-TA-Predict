@@ -1,0 +1,31 @@
+{
+  "model_type": "RandomForestClassifier",
+  "period_days": 20,
+  "period_name": "20天(1月)",
+  "features": [
+    "close",
+    "vol",
+    "O-C",
+    "H-L",
+    "MA5",
+    "MA10",
+    "RSI",
+    "MOM",
+    "EMA12",
+    "EMA26",
+    "MACD",
+    "MACDsignal",
+    "MACDhist"
+  ],
+  "feature_count": 13,
+  "accuracy": 0.5543478260869565,
+  "model_params": {
+    "max_depth": 2,
+    "n_estimators": 20,
+    "min_samples_leaf": 30,
+    "random_state": 120
+  },
+  "training_date": "2025-05-24 23:10:52",
+  "stock_code": "000063.SZ",
+  "stock_name": "中兴通讯"
+}
