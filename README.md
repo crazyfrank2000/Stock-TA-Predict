@@ -732,3 +732,51 @@ RSI=38.1 ✅, MACD=-0.23 ✅, O-C=0.45 ✅
 ---
 
 *本系统仅用于技术研究和学习目的* 
+
+## 🔗 纳斯达克100与黄金相关性分析
+
+新增脚本 `analyze_nasdaq100_gold_correlation.py` 可从 Yahoo Finance 公共图表接口下载纳斯达克100指数与黄金价格，按共同交易日对齐后计算相关性。
+
+> 文件位置：脚本已提交在仓库根目录 `./analyze_nasdaq100_gold_correlation.py`，请在项目根目录运行下面的命令。
+
+### 快速运行
+
+```bash
+python analyze_nasdaq100_gold_correlation.py --start 2015-01-01 --end 2026-05-13
+```
+
+### 默认标的
+
+- **纳斯达克100**: `^NDX`
+- **黄金**: `GC=F`（COMEX黄金期货）
+
+如需使用 ETF 近似分析，可改用：
+
+```bash
+python analyze_nasdaq100_gold_correlation.py --nasdaq-symbol QQQ --gold-symbol GLD --start 2015-01-01
+```
+
+### 分析内容
+
+脚本会输出并保存以下结果：
+
+- 价格水平相关性
+- 日收益率相关性
+- 最新滚动窗口收益率相关性（默认 60 个交易日）
+- 纳斯达克100与黄金的年化波动率
+- 纳斯达克100相对黄金日收益的 Beta
+- 黄金收益率领先/滞后纳斯达克100收益率的相关性（默认 ±10 个交易日）
+
+### 输出文件
+
+默认保存到 `reports/` 目录：
+
+| 文件 | 说明 |
+|------|------|
+| `nasdaq100_gold_aligned_data.csv` | 对齐后的价格与收益率数据 |
+| `nasdaq100_gold_correlation_summary.csv` | 核心相关性与风险统计汇总 |
+| `nasdaq100_gold_lag_correlations.csv` | 领先/滞后相关性表 |
+| `nasdaq100_gold_correlation.png` | 价格归一化、滚动相关性和收益率散点图 |
+| `nasdaq100_gold_lag_correlation.png` | 领先/滞后相关性柱状图 |
+
+> 注：该脚本需要联网下载行情数据；如果当前环境无法访问 Yahoo Finance，可先在有网络的环境运行，或后续扩展为读取本地CSV。
