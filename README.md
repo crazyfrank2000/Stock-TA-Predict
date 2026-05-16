@@ -780,3 +780,89 @@ python analyze_nasdaq100_gold_correlation.py --nasdaq-symbol QQQ --gold-symbol G
 | `nasdaq100_gold_lag_correlation.png` | 领先/滞后相关性柱状图 |
 
 > 注：该脚本需要联网下载行情数据；如果当前环境无法访问 Yahoo Finance，可先在有网络的环境运行，或后续扩展为读取本地CSV。
+
+## 🔄 板块轮动与未来20个交易日强势板块预测
+
+新增 `sector_rotation.py` 用于 ETF/板块轮动量化分析，适合分析能源、科技、半导体、金融、小盘、贵金属、债券和海外市场等资产之间的相对强弱。
+
+### 输入数据格式
+
+脚本使用 ETF 日线长表 CSV，至少需要以下列：
+
+```csv
+date,symbol,close,volume,sector,name
+2026-05-15,SPY,739.17,80000000,US Large Cap,SPDR S&P 500
+2026-05-15,XLE,59.44,30000000,Energy,Energy Select Sector SPDR
+2026-05-15,SMH,556.34,12000000,Semiconductors,VanEck Semiconductor
+```
+
+必需列：
+- `date`: 交易日期
+- `symbol`: ETF代码
+- `close`: 收盘价
+
+可选列：
+- `volume`: 成交量，用于成交量确认因子；缺失时默认不放大/惩罚
+- `sector`: 板块分类；缺失时会按常见 ETF 代码自动补齐部分分类
+- `name`: ETF名称；缺失时使用 `symbol`
+
+### 因子与评分逻辑
+
+`sector_rotation.py` 会计算以下轮动因子：
+
+- 5日、20日、60日收益率
+- 相对基准 ETF（默认 `SPY`）的超额收益
+- 20日、60日均线趋势
+- 20日/60日均线比值
+- 20日波动率
+- 60日最大回撤
+- 成交量相对20日均量
+- 5日轮动分数变化
+
+然后对每天的 ETF 截面做 z-score 标准化，合成 `rotation_score`，用于排序当前强势板块。
+
+### 未来20个交易日预测
+
+脚本提供 `forecast_20d_strength`，用于预测未来20个交易日更可能强势的板块。它不是直接使用未来真实收益，而是使用历史条件分布模拟：
+
+1. 取最新交易日每个 ETF 的 `rotation_score`；
+2. 查找历史上同 ETF 或全市场中轮动分数不低于当前水平的样本；
+3. 从这些历史样本的未来20日收益中进行 bootstrap 模拟；
+4. 输出预期20日收益、预期超额收益、上涨概率、跑赢基准概率和 25%/50%/75% 分位数。
+
+### 历史模拟/回测
+
+脚本还提供 `backtest_top_n_rotation`，用于模拟：
+
+- 每20个交易日调仓一次；
+- 买入 `rotation_score` 最高的前 N 个 ETF；
+- 等权持有到下一个调仓日；
+- 扣除换手成本；
+- 对比基准 ETF（默认 `SPY`）。
+
+### 使用示例
+
+```bash
+python sector_rotation.py --input data/etf_prices.csv --top-n 5 --simulate
+```
+
+指定基准、预测周期和模拟次数：
+
+```bash
+python sector_rotation.py \
+  --input data/etf_prices.csv \
+  --benchmark SPY \
+  --horizon 20 \
+  --top-n 5 \
+  --simulate \
+  --simulations 5000
+```
+
+输出包括：
+
+1. 最新板块轮动排名；
+2. 未来20个交易日强势板块预测/模拟；
+3. 当前轮动状态描述；
+4. 如果开启 `--simulate`，还会输出历史模拟绩效和最近5次调仓记录。
+
+> 注意：预测结果是基于历史条件分布和当前相对强弱的模拟，不构成投资建议。实际使用时应结合交易成本、流动性、宏观事件和风险预算。
