@@ -238,33 +238,37 @@ def simulate_implied_corr_ou(
 
 def run_backtest(params: MarketParams, seed: int = 42) -> pd.DataFrame:
     """
-    执行相关性套利策略回测
+    相关性套利策略完整回测（三个盈利来源）
 
-    组合构建:
-        - 做空指数 ATM straddle（每个再平衡日）
-        - 做多等 vega 的成分股 straddle 篮子
-        - PnL = vega * d_sigma（单位归一化到 1 美元名义本金）
-        - 每日记录 PnL、隐含相关性、实际相关性
+    PnL 构成：
+      1. Vega PnL     : 隐含波动率变动带来的头寸盈亏（vega × Δσ）
+      2. Gamma Carry  : 指数实际方差低于隐含方差的持续收益
+                        = 0.5 × Γ × (σ²_implied - σ²_realized) × dt
+                        等价于：(ρ_implied - ρ_realized) × 分散化因子
+      3. Stock Gamma  : 做多个股 straddle 的 delta 再对冲收益
+
+    归一化：S=1，以单位名义本金计算，收益即为百分比。
     """
     np.random.seed(seed)
     dt = 1 / 252
-    T_option = 30 / 252  # 30 天期权
+    T_option = 30 / 252  # 30 天到期期权
 
-    # 固定权重（随机生成后固定）
     weights = np.random.dirichlet(np.ones(params.n_stocks))
     stock_base_ivs = np.clip(
         np.random.normal(params.stock_vol_mean, params.stock_vol_std, params.n_stocks),
         0.10, 0.80
     )
 
-    # 模拟个股隐含波动率序列
+    # 个股 IV：OU 均值回归到各自基准 IV
     stock_iv_paths = simulate_implied_vols(stock_base_ivs, params.T_days)
 
-    # 用 OU 过程模拟隐含相关性（均值回归到 true_corr + premium）
+    # 隐含相关性：OU 均值回归到 (真实相关性 + 溢价)
     mu_implied = params.true_corr + params.implied_corr_premium
     implied_corr_path = simulate_implied_corr_ou(
         params.T_days, mu=mu_implied, theta_speed=2.0, sigma_vol=0.05
     )
+
+    # 指数 IV = f(implied_corr, stock_ivs)
     index_iv_path = np.array([
         np.sqrt(
             implied_corr_path[t] * np.sum(weights * stock_iv_paths[t]) ** 2
@@ -273,78 +277,101 @@ def run_backtest(params: MarketParams, seed: int = 42) -> pd.DataFrame:
         for t in range(params.T_days)
     ])
 
-    # 模拟实际收益率（真实相关性 < 隐含相关性）
+    # 实际收益率：使用真实相关性生成，个股 IV 为基准
     realized_returns = simulate_correlated_returns(
         params.n_stocks, params.T_days, params.true_corr, stock_base_ivs
     )
+    index_returns = realized_returns @ weights  # 指数日收益
 
-    # ── 标准化 vega：以 S=1, K=1 计算，消除价格量纲 ──────────────────
-    # straddle_vega(iv, T) = 2 * bs_vega(1, 1, T, r, iv)
-    def unit_straddle_vega(iv, T=T_option):
+    # ── 辅助函数（归一化 S=1）──────────────────────────────────────
+    def unit_vega(iv, T=T_option):
+        """ATM straddle 单位 vega"""
         return 2 * bs_vega(1.0, 1.0, T, params.rf, iv)
 
-    # 再平衡时记录的持仓 vega（单位：归一化）
-    pos_idx_vega = 0.0          # 指数空头 vega（每单位名义）
-    pos_stk_vega = np.zeros(params.n_stocks)  # 各股票多头 vega
+    def unit_gamma(iv, T=T_option):
+        """ATM straddle 单位 gamma = vega / (sigma × T)"""
+        d1 = iv * np.sqrt(T) / 2
+        return 2 * norm.pdf(d1) / (iv * np.sqrt(T))
+
+    # ── 持仓状态 ──────────────────────────────────────────────────
+    pos_idx_vega  = 0.0
+    pos_stk_vega  = np.zeros(params.n_stocks)
+    pos_idx_gamma = 0.0
+    pos_stk_gamma = np.zeros(params.n_stocks)
 
     records = []
     for t in range(params.T_days):
-        idx_iv = index_iv_path[t]
+        idx_iv  = index_iv_path[t]
         stk_ivs = stock_iv_paths[t]
 
-        # 计算隐含相关性
+        # 隐含 / 实际相关性
         ic = implied_correlation(idx_iv, stk_ivs, weights)
-
-        # 计算 60 日滚动实际相关性
         window = min(t + 1, 60)
-        rc = realized_correlation(realized_returns[max(0, t - window + 1):t + 1], weights) \
-            if window >= 5 else np.nan
+        rc = realized_correlation(
+            realized_returns[max(0, t - window + 1):t + 1], weights
+        ) if window >= 5 else np.nan
         corr_gap = (ic - rc) if not np.isnan(rc) else np.nan
 
-        # ── 每日 Vega PnL ─────────────────────────────────────────────
-        # d_sigma 驱动 PnL，vega 已归一化到 1 单位名义
-        if t > 0 and (pos_idx_vega != 0 or pos_stk_vega.any()):
-            d_idx_iv = idx_iv - index_iv_path[t - 1]
+        pnl_vega = pnl_gamma = 0.0
+
+        if t > 0 and pos_idx_vega != 0:
+            r_idx = index_returns[t]
+            r_stk = realized_returns[t]
+
+            # ── 1. Vega PnL（IV 变动） ───────────────────────────
+            d_idx_iv  = idx_iv - index_iv_path[t - 1]
             d_stk_ivs = stk_ivs - stock_iv_paths[t - 1]
+            pnl_vega = (
+                -pos_idx_vega * d_idx_iv
+                + float(np.sum(pos_stk_vega * d_stk_ivs))
+            )
 
-            # 做空指数：IV 上涨亏损，IV 下跌获利
-            pnl_idx = -pos_idx_vega * d_idx_iv
-            # 做多个股：IV 上涨获利
-            pnl_stk = float(np.sum(pos_stk_vega * d_stk_ivs))
-            # Theta 成本（做多波动率净 theta ≈ -vega*sigma²/2T，简化近似）
-            net_long_vega = float(np.sum(pos_stk_vega)) - pos_idx_vega
-            theta = -max(net_long_vega, 0) * idx_iv ** 2 / (2 * T_option) * dt
-            daily_pnl = pnl_idx + pnl_stk + theta
-        else:
-            daily_pnl = 0.0
+            # ── 2. Gamma-Theta PnL（realized var vs implied var） ─
+            # 做空指数：实际方差 < 隐含方差时获利（相关性溢价的来源）
+            pnl_gamma_idx = -0.5 * pos_idx_gamma * (r_idx ** 2 - idx_iv ** 2 * dt)
 
-        # ── 再平衡 ───────────────────────────────────────────────────
+            # 做多个股：实际方差 > 隐含方差时获利（个股 IV 校准准确时约为零）
+            pnl_gamma_stk = 0.5 * float(
+                np.sum(pos_stk_gamma * (r_stk ** 2 - stk_ivs ** 2 * dt))
+            )
+            pnl_gamma = pnl_gamma_idx + pnl_gamma_stk
+
+        daily_pnl = pnl_vega + pnl_gamma
+
+        # ── 再平衡 ─────────────────────────────────────────────────
         if t % params.rebalance_days == 0:
-            iv_idx = unit_straddle_vega(idx_iv)
-            iv_stk = np.array([unit_straddle_vega(iv) for iv in stk_ivs])
-            # 开仓条件：相关性溢价 > 5%
+            v_idx = unit_vega(idx_iv)
+            v_stk = np.array([unit_vega(iv) for iv in stk_ivs])
+            g_idx = unit_gamma(idx_iv)
+            g_stk = np.array([unit_gamma(iv) for iv in stk_ivs])
+
             if not np.isnan(corr_gap) and corr_gap > 0.05:
-                pos_idx_vega = iv_idx
-                # 每只股票的 vega 贡献 = w_i * idx_vega（按权重分配指数 vega）
-                # 买入份数 = (w_i * idx_vega) / stk_vega_per_unit，但 PnL 以 vega 计
-                pos_stk_vega = weights * iv_idx  # 各股票 vega 分配量
+                # vega 中性：各股票 vega 合计 = 指数 vega
+                pos_idx_vega  = v_idx
+                pos_stk_vega  = weights * v_idx          # 各股 vega 分配
+
+                # gamma 按 vega/sigma/T 关系同步确定
+                pos_idx_gamma = g_idx
+                pos_stk_gamma = weights * v_idx / (stk_ivs * T_option)
             else:
-                pos_idx_vega = 0.0
-                pos_stk_vega = np.zeros(params.n_stocks)
+                pos_idx_vega  = pos_idx_gamma = 0.0
+                pos_stk_vega  = np.zeros(params.n_stocks)
+                pos_stk_gamma = np.zeros(params.n_stocks)
 
         records.append({
-            "day": t,
-            "index_iv": idx_iv,
-            "implied_corr": ic,
+            "day":           t,
+            "index_iv":      idx_iv,
+            "implied_corr":  ic,
             "realized_corr": rc,
-            "corr_gap": corr_gap,
-            "daily_pnl": daily_pnl,
+            "corr_gap":      corr_gap,
+            "pnl_vega":      pnl_vega,
+            "pnl_gamma":     pnl_gamma,
+            "daily_pnl":     daily_pnl,
         })
 
     df = pd.DataFrame(records)
-    df["cum_pnl"] = df["daily_pnl"].cumsum()
-    # 假设初始名义本金 = 1，累计 PnL 即为百分比收益
-    df["cum_pnl_pct"] = df["cum_pnl"]
+    df["cum_pnl"]     = df["daily_pnl"].cumsum()
+    df["cum_pnl_pct"] = df["cum_pnl"]   # 归一化，直接为百分比收益
     return df
 
 
@@ -361,21 +388,26 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
     cum = df["cum_pnl_pct"]
     rolling_max = cum.cummax()
-    drawdown = cum - rolling_max
-    max_dd = drawdown.min()
+    max_dd = (cum - rolling_max).min()
+    calmar = annual_ret / abs(max_dd) if max_dd != 0 else np.nan
 
-    # 在仓天数
     active_days = (df["corr_gap"] > 0.05).sum()
+    vega_contrib  = df["pnl_vega"].sum()
+    gamma_contrib = df["pnl_gamma"].sum()
+    total         = df["daily_pnl"].sum()
 
     return {
-        "年化收益 (归一化)": f"{annual_ret:.4f}",
-        "年化波动率": f"{annual_vol:.4f}",
-        "夏普比率": f"{sharpe:.2f}",
-        "最大回撤": f"{max_dd:.4f}",
-        "平均隐含相关性": f"{df['implied_corr'].mean():.4f}",
-        "平均实际相关性": f"{df['realized_corr'].dropna().mean():.4f}",
-        "平均相关性溢价": f"{df['corr_gap'].dropna().mean():.4f}",
-        "持仓天数占比": f"{active_days / len(df):.1%}",
+        "年化收益率":      f"{annual_ret:.2%}",
+        "年化波动率":      f"{annual_vol:.2%}",
+        "夏普比率":        f"{sharpe:.2f}",
+        "Calmar 比率":    f"{calmar:.2f}",
+        "最大回撤":        f"{max_dd:.2%}",
+        "平均隐含相关性":  f"{df['implied_corr'].mean():.4f}",
+        "平均实际相关性":  f"{df['realized_corr'].dropna().mean():.4f}",
+        "平均相关性溢价":  f"{df['corr_gap'].dropna().mean():.4f}",
+        "持仓天数占比":    f"{active_days / len(df):.1%}",
+        "Vega PnL 占比":  f"{vega_contrib / total:.1%}" if total != 0 else "N/A",
+        "Gamma PnL 占比": f"{gamma_contrib / total:.1%}" if total != 0 else "N/A",
     }
 
 
@@ -384,7 +416,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 # ─────────────────────────────────────────────
 
 def plot_results(df: pd.DataFrame, metrics: dict, save_path: str = "correlation_arb_results.png"):
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16))
     fig.suptitle("相关性套利策略回测结果\nCorrelation Arbitrage Backtest", fontsize=14, fontweight="bold")
 
     x = df["day"]
@@ -395,43 +427,54 @@ def plot_results(df: pd.DataFrame, metrics: dict, save_path: str = "correlation_
     ax1.plot(x, df["realized_corr"], label="实际相关性 (Realized Corr, 60d)", color="#2ECC71", linewidth=1.2)
     ax1.fill_between(x, df["realized_corr"], df["implied_corr"],
                      where=df["implied_corr"] > df["realized_corr"],
-                     alpha=0.2, color="#E74C3C", label="套利空间")
+                     alpha=0.2, color="#E74C3C", label="套利空间（相关性溢价）")
     ax1.set_ylabel("相关性")
     ax1.set_title("隐含相关性 vs 实际相关性")
     ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
-    # --- 图2: 累计 PnL ---
+    # --- 图2: 累计 PnL 总收益 ---
     ax2 = axes[1]
-    ax2.plot(x, df["cum_pnl_pct"] * 100, color="#3498DB", linewidth=1.5, label="累计收益 (%)")
+    cum_pct = df["cum_pnl_pct"] * 100
+    ax2.plot(x, cum_pct, color="#3498DB", linewidth=1.8, label="总累计收益 (%)")
     ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
-    ax2.fill_between(x, 0, df["cum_pnl_pct"] * 100,
-                     where=df["cum_pnl_pct"] >= 0, alpha=0.2, color="#2ECC71")
-    ax2.fill_between(x, 0, df["cum_pnl_pct"] * 100,
-                     where=df["cum_pnl_pct"] < 0, alpha=0.2, color="#E74C3C")
+    ax2.fill_between(x, 0, cum_pct, where=cum_pct >= 0, alpha=0.2, color="#2ECC71")
+    ax2.fill_between(x, 0, cum_pct, where=cum_pct < 0,  alpha=0.2, color="#E74C3C")
     ax2.set_ylabel("累计收益 (%)")
-    ax2.set_title("策略累计收益")
+    ax2.set_title("策略总累计收益")
     ax2.legend(loc="upper left", fontsize=9)
     ax2.grid(True, alpha=0.3)
 
     # 标注关键指标
     metrics_text = "\n".join([f"{k}: {v}" for k, v in metrics.items()])
-    ax2.text(0.98, 0.05, metrics_text, transform=ax2.transAxes,
-             fontsize=8, verticalalignment="bottom", horizontalalignment="right",
-             bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8))
+    ax2.text(0.015, 0.97, metrics_text, transform=ax2.transAxes,
+             fontsize=7.5, verticalalignment="top",
+             bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85))
 
-    # --- 图3: 相关性溢价（corr gap）分布 ---
+    # --- 图3: PnL 来源拆分（累计 Vega vs Gamma）---
     ax3 = axes[2]
-    gap = df["corr_gap"].dropna()
-    ax3.hist(gap, bins=50, color="#9B59B6", alpha=0.7, edgecolor="white", linewidth=0.5)
-    ax3.axvline(gap.mean(), color="#E74C3C", linewidth=2, linestyle="--",
-                label=f"均值 = {gap.mean():.4f}")
-    ax3.axvline(0, color="black", linewidth=1, linestyle="-")
-    ax3.set_xlabel("相关性溢价 (Implied - Realized)")
-    ax3.set_ylabel("频数")
-    ax3.set_title("相关性溢价分布（套利空间直方图）")
-    ax3.legend(fontsize=9)
+    cum_vega  = df["pnl_vega"].cumsum() * 100
+    cum_gamma = df["pnl_gamma"].cumsum() * 100
+    ax3.plot(x, cum_vega,  label="Vega PnL（IV变动）",  color="#E67E22", linewidth=1.2)
+    ax3.plot(x, cum_gamma, label="Gamma PnL（方差溢价）", color="#8E44AD", linewidth=1.2)
+    ax3.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax3.set_ylabel("累计收益 (%)")
+    ax3.set_title("PnL 来源拆分：Vega vs Gamma Carry")
+    ax3.legend(loc="upper left", fontsize=9)
     ax3.grid(True, alpha=0.3)
+
+    # --- 图4: 相关性溢价分布 ---
+    ax4 = axes[3]
+    gap = df["corr_gap"].dropna()
+    ax4.hist(gap, bins=50, color="#9B59B6", alpha=0.7, edgecolor="white", linewidth=0.5)
+    ax4.axvline(gap.mean(), color="#E74C3C", linewidth=2, linestyle="--",
+                label=f"均值 = {gap.mean():.4f}")
+    ax4.axvline(0, color="black", linewidth=1)
+    ax4.set_xlabel("相关性溢价 (Implied − Realized)")
+    ax4.set_ylabel("频数")
+    ax4.set_title("相关性溢价分布（套利空间直方图）")
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -502,7 +545,7 @@ def sensitivity_analysis():
         m = compute_metrics(df)
         results.append({
             "隐含溢价": f"{premium:.0%}",
-            "年化收益": m["年化收益 (归一化)"],
+            "年化收益": m["年化收益率"],
             "夏普比率": m["夏普比率"],
             "最大回撤": m["最大回撤"],
         })
