@@ -197,15 +197,43 @@ def simulate_implied_vols(
     vol_of_vol: float = 0.02,
     mean_reversion: float = 0.1,
 ) -> np.ndarray:
-    """模拟隐含波动率时间序列（均值回归过程）"""
+    """模拟个股隐含波动率时间序列（OU 均值回归过程）"""
+    dt = 1 / 252
     n = len(base_vols)
     iv_paths = np.zeros((T, n))
     iv_paths[0] = base_vols
     for t in range(1, T):
-        noise = np.random.randn(n) * vol_of_vol
-        iv_paths[t] = iv_paths[t - 1] + mean_reversion * (base_vols - iv_paths[t - 1]) + noise
+        noise = np.random.randn(n) * vol_of_vol * np.sqrt(dt)
+        iv_paths[t] = (iv_paths[t - 1]
+                       + mean_reversion * (base_vols - iv_paths[t - 1]) * dt
+                       + noise)
         iv_paths[t] = np.clip(iv_paths[t], 0.05, 1.5)
     return iv_paths
+
+
+def simulate_implied_corr_ou(
+    T: int,
+    mu: float,
+    theta_speed: float = 2.0,
+    sigma_vol: float = 0.05,
+) -> np.ndarray:
+    """
+    用 Ornstein-Uhlenbeck 过程模拟隐含相关性路径
+
+    dρ = θ(μ - ρ)dt + σ dW
+
+    参数:
+        mu          : 长期均值（真实相关性 + 溢价）
+        theta_speed : 均值回归速度（越大回归越快）
+        sigma_vol   : 相关性波动率
+    """
+    dt = 1 / 252
+    path = np.zeros(T)
+    path[0] = mu
+    for t in range(1, T):
+        dW = np.random.randn() * np.sqrt(dt)
+        path[t] = path[t - 1] + theta_speed * (mu - path[t - 1]) * dt + sigma_vol * dW
+    return np.clip(path, 0.05, 0.95)
 
 
 def run_backtest(params: MarketParams, seed: int = 42) -> pd.DataFrame:
@@ -232,11 +260,10 @@ def run_backtest(params: MarketParams, seed: int = 42) -> pd.DataFrame:
     # 模拟个股隐含波动率序列
     stock_iv_paths = simulate_implied_vols(stock_base_ivs, params.T_days)
 
-    # 由隐含相关性 + 个股 IV 推算指数 IV（使隐含相关性 = 真实 + 溢价）
-    implied_corr_path = np.clip(
-        params.true_corr + params.implied_corr_premium
-        + np.cumsum(np.random.normal(0, 0.003, params.T_days)),
-        0.05, 0.95
+    # 用 OU 过程模拟隐含相关性（均值回归到 true_corr + premium）
+    mu_implied = params.true_corr + params.implied_corr_premium
+    implied_corr_path = simulate_implied_corr_ou(
+        params.T_days, mu=mu_implied, theta_speed=2.0, sigma_vol=0.05
     )
     index_iv_path = np.array([
         np.sqrt(
@@ -298,10 +325,9 @@ def run_backtest(params: MarketParams, seed: int = 42) -> pd.DataFrame:
             # 开仓条件：相关性溢价 > 5%
             if not np.isnan(corr_gap) and corr_gap > 0.05:
                 pos_idx_vega = iv_idx
-                # 每只股票分配的 vega = w_i * idx_vega
-                pos_stk_vega = weights * iv_idx / (iv_stk + 1e-12) * iv_stk
-                # 即 pos_stk_vega[i] = weights[i] * idx_vega（vega 等量分配）
-                pos_stk_vega = weights * iv_idx
+                # 每只股票的 vega 贡献 = w_i * idx_vega（按权重分配指数 vega）
+                # 买入份数 = (w_i * idx_vega) / stk_vega_per_unit，但 PnL 以 vega 计
+                pos_stk_vega = weights * iv_idx  # 各股票 vega 分配量
             else:
                 pos_idx_vega = 0.0
                 pos_stk_vega = np.zeros(params.n_stocks)
